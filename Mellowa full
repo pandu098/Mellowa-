@@ -1,0 +1,505 @@
+/// main.dart
+// Mellowa 💜 - FINAL version (calls removed).
+// Features included:
+// - Auth (Google, anonymous), user doc creation
+// - Posts feed (Firestore) with Ad-per-day enforcement (30 ads/day/user) and Ad placeholders
+// - Search page
+// - Camera page (picker, simple filter preview, upload to Firestore & Storage)
+// - Chats page (real-time Firestore chats) + Moments 🌸 integrated into Chats screen
+// - Profile page (moments summary, premium toggle mock, biometric app lock, invite code)
+// - In-app-purchase skeleton (no server-side receipt validation — implement for production)
+// - Null-safety and transaction-safe Firestore updates
+//
+// Required pubspec dependencies (add these):
+// firebase_core, firebase_auth, cloud_firestore, firebase_storage, google_sign_in,
+// google_mobile_ads, local_auth, image_picker, in_app_purchase, uuid, intl
+//
+// BEFORE RUNNING:
+// - Configure Firebase (FlutterFire CLI -> firebase_options.dart) or call Firebase.initializeApp() with options
+// - Replace Ad unit ids with real AdMob ids when ready
+// - Configure IAP product IDs in Play/App Store and update kProductIds
+// - Platform-specific setup: AndroidManifest (AdMob, Internet), iOS plist (AdMob keys)
+// - For production: implement server-side IAP receipt validation and security measures.
+
+import 'dart:async';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+// If you generated firebase_options.dart with FlutterFire CLI, import it and use it in initializeApp.
+// import 'firebase_options.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:local_auth/local_auth.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:uuid/uuid.dart';
+import 'package:intl/intl.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  // If using firebase_options.dart:
+  // await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  MobileAds.instance.initialize();
+  runApp(MellowaApp());
+}
+
+class MellowaApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Mellowa 💜',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(primarySwatch: Colors.purple),
+      home: AuthGate(),
+    );
+  }
+}
+
+/// ---------------- AUTH GATE ----------------
+class AuthGate extends StatefulWidget {
+  @override
+  _AuthGateState createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  User? _user;
+  StreamSubscription<User?>? _sub;
+  final GoogleSignIn _google = GoogleSignIn();
+
+  final TextEditingController _emailC = TextEditingController();
+  final TextEditingController _passC = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _user = FirebaseAuth.instance.currentUser;
+    _sub = FirebaseAuth.instance.authStateChanges().listen((u) {
+      setState(() => _user = u);
+      if (u != null) _ensureUserDoc(u);
+    });
+  }
+
+  Future<void> _ensureUserDoc(User u) async {
+    final usersRef = FirebaseFirestore.instance.collection('users');
+    final doc = usersRef.doc(u.uid);
+    final snap = await doc.get();
+    if (!snap.exists) {
+      await doc.set({
+        'displayName': u.displayName ?? 'Anonymous',
+        'email': u.email ?? '',
+        'photoURL': u.photoURL ?? '',
+        'createdAt': FieldValue.serverTimestamp(),
+        'premium': false,
+        'adsShownDate': '', // yyyy-MM-dd
+        'adsShownCount': 0,
+        'moments': {'currentStreak': 0, 'lastMomentDate': ''},
+        'inviteCode': Uuid().v4().substring(0, 8),
+      }, SetOptions(merge: true));
+    }
+  }
+
+  Future<void> _signInGoogle() async {
+    try {
+      final account = await _google.signIn();
+      if (account == null) return;
+      final auth = await account.authentication;
+      final cred = GoogleAuthProvider.credential(idToken: auth.idToken, accessToken: auth.accessToken);
+      final res = await FirebaseAuth.instance.signInWithCredential(cred);
+      if (res.user != null) await _ensureUserDoc(res.user!);
+    } catch (e) {
+      debugPrint('Google sign error: $e');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Google sign-in failed')));
+    }
+  }
+
+  Future<void> _signInAnon() async {
+    try {
+      final res = await FirebaseAuth.instance.signInAnonymously();
+      if (res.user != null) await _ensureUserDoc(res.user!);
+    } catch (e) {
+      debugPrint('Anon sign error: $e');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Anonymous sign-in failed')));
+    }
+  }
+
+  Future<void> _signInWithEmail() async {
+    final email = _emailC.text.trim();
+    final pass = _passC.text;
+    if (email.isEmpty || pass.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Enter email & password')));
+      return;
+    }
+    try {
+      final cred = await FirebaseAuth.instance.signInWithEmailAndPassword(email: email, password: pass);
+      if (cred.user != null) await _ensureUserDoc(cred.user!);
+    } catch (e) {
+      // Try create
+      try {
+        final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(email: email, password: pass);
+        if (cred.user != null) await _ensureUserDoc(cred.user!);
+      } catch (e2) {
+        debugPrint('Email auth error: $e2');
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Email auth failed')));
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    _emailC.dispose();
+    _passC.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_user == null) {
+      return Scaffold(
+        body: SafeArea(
+          child: SingleChildScrollView(
+            padding: EdgeInsets.all(20),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              SizedBox(height: 20),
+              Text('Mellowa 💜', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
+              SizedBox(height: 18),
+              TextField(controller: _emailC, decoration: InputDecoration(labelText: 'Email')),
+              SizedBox(height: 8),
+              TextField(controller: _passC, decoration: InputDecoration(labelText: 'Password'), obscureText: true),
+              SizedBox(height: 12),
+              ElevatedButton(onPressed: _signInWithEmail, child: Text('Sign in / Create')),
+              SizedBox(height: 10),
+              ElevatedButton.icon(icon: Icon(Icons.login), label: Text('Continue with Google'), onPressed: _signInGoogle),
+              SizedBox(height: 10),
+              TextButton(onPressed: _signInAnon, child: Text('Continue anonymously')),
+            ]),
+          ),
+        ),
+      );
+    }
+    return HomeScreen();
+  }
+}
+
+/// ---------------- HOME (5 tabs but calls removed) ----------------
+class HomeScreen extends StatefulWidget {
+  @override
+  _HomeScreenState createState() => _HomeScreenState();
+}
+class _HomeScreenState extends State<HomeScreen> {
+  int _index = 0;
+  final _pages = [PostsPage(), SearchPage(), CameraPage(), ChatsAndMomentsPage(), ProfilePage()];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(index: _index, children: _pages),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _index,
+        type: BottomNavigationBarType.fixed,
+        onTap: (i) => setState(() => _index = i),
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home_outlined), label: 'Posts'),
+          BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Search'),
+          BottomNavigationBarItem(icon: Icon(Icons.camera_alt), label: 'Camera'),
+          BottomNavigationBarItem(icon: Icon(Icons.chat_bubble_outline), label: 'Chats'),
+          BottomNavigationBarItem(icon: Icon(Icons.person_outline), label: 'Profile'),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => setState(() => _index = 2),
+        backgroundColor: Colors.purple,
+        child: Icon(Icons.add),
+      ),
+    );
+  }
+}
+
+/// ---------------- POSTS PAGE (ads enforcement) ----------------
+class PostsPage extends StatefulWidget {
+  @override
+  _PostsPageState createState() => _PostsPageState();
+}
+class _PostsPageState extends State<PostsPage> {
+  final postsRef = FirebaseFirestore.instance.collection('posts');
+  final usersRef = FirebaseFirestore.instance.collection('users');
+  final todayKey = () => DateFormat('yyyy-MM-dd').format(DateTime.now());
+  List<QueryDocumentSnapshot> _docs = [];
+  StreamSubscription<QuerySnapshot>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = postsRef.orderBy('createdAt', descending: true).snapshots().listen((snap) {
+      setState(() => _docs = snap.docs);
+    }, onError: (e) => debugPrint('posts stream error: $e'));
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  Future<bool> _canShowAdAndIncrement() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return false;
+    final docRef = usersRef.doc(uid);
+    return FirebaseFirestore.instance.runTransaction<bool>((tx) async {
+      final snap = await tx.get(docRef);
+      final data = snap.data() ?? {};
+      final premium = (data['premium'] as bool?) ?? false;
+      if (premium) return false;
+      final String shownDate = (data['adsShownDate'] as String?) ?? '';
+      int shownCount = (data['adsShownCount'] as int?) ?? 0;
+      final String today = todayKey();
+      if (shownDate != today) shownCount = 0;
+      if (shownCount >= 30) return false;
+      tx.set(docRef, {'adsShownDate': today, 'adsShownCount': shownCount + 1}, SetOptions(merge: true));
+      return true;
+    }).catchError((e) {
+      debugPrint('ad tx error: $e');
+      return false;
+    });
+  }
+
+  Widget _adPlaceholder() {
+    return FutureBuilder<bool>(
+      future: _canShowAdAndIncrement(),
+      builder: (c, snap) {
+        if (!snap.hasData) return SizedBox();
+        if (!snap.data!) return SizedBox();
+        // Replace this Card with a real AdMob widget (Banner/Native) when integrating.
+        return Card(
+          margin: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          color: Colors.purple.shade50,
+          child: Padding(
+            padding: EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Sponsored', style: TextStyle(fontWeight: FontWeight.bold)),
+              SizedBox(height: 8),
+              Text('This is a placeholder ad. Replace with AdMob Banner / Native ad.'),
+              SizedBox(height: 8),
+              ElevatedButton(onPressed: () => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Ad clicked'))), child: Text('Learn more')),
+            ]),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_docs.isEmpty) return Scaffold(appBar: AppBar(title: Text('Posts')), body: Center(child: Text('No posts yet')));
+    final List<Widget> items = [];
+    for (int i = 0; i < _docs.length; i++) {
+      final d = _docs[i].data() as Map<String, dynamic>? ?? {};
+      final author = d['authorName'] as String? ?? 'Unknown';
+      final text = d['text'] as String? ?? '';
+      final imageUrl = d['imageUrl'] as String? ?? '';
+      final likesCount = (d['likes'] as List<dynamic>?)?.length ?? 0;
+      items.add(Card(
+        margin: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Padding(
+          padding: EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(author, style: TextStyle(fontWeight: FontWeight.bold)),
+            if (text.isNotEmpty) ...[SizedBox(height: 8), Text(text)],
+            if (imageUrl.isNotEmpty) ...[SizedBox(height: 8), Image.network(imageUrl, errorBuilder: (_, __, ___) => SizedBox())],
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              IconButton(icon: Icon(Icons.favorite_border), onPressed: () => _toggleLike(_docs[i])),
+              Text('$likesCount'),
+            ])
+          ]),
+        ),
+      ));
+      if ((i + 1) % 4 == 0) items.add(_adPlaceholder());
+    }
+    return Scaffold(appBar: AppBar(title: Text('Posts')), body: ListView(children: items));
+  }
+
+  Future<void> _toggleLike(QueryDocumentSnapshot docSnap) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final docRef = docSnap.reference;
+    FirebaseFirestore.instance.runTransaction((tx) async {
+      final snap = await tx.get(docRef);
+      final data = snap.data() as Map<String, dynamic>? ?? {};
+      final likes = List<String>.from(data['likes'] ?? []);
+      if (likes.contains(uid)) likes.remove(uid); else likes.add(uid);
+      tx.update(docRef, {'likes': likes});
+    }).catchError((e) => debugPrint('like tx error: $e'));
+  }
+}
+
+/// ---------------- SEARCH PAGE ----------------
+class SearchPage extends StatefulWidget {
+  @override
+  _SearchPageState createState() => _SearchPageState();
+}
+class _SearchPageState extends State<SearchPage> {
+  String _q = '';
+  final postsRef = FirebaseFirestore.instance.collection('posts');
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Search')),
+      body: Column(children: [
+        Padding(
+          padding: EdgeInsets.all(12),
+          child: TextField(decoration: InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Search users, posts, hashtags...'), onChanged: (v) => setState(() => _q = v.trim())),
+        ),
+        Expanded(
+          child: _q.isEmpty
+              ? Center(child: Text('Type to search'))
+              : FutureBuilder<QuerySnapshot>(
+                  future: postsRef.where('keywords', arrayContains: _q.toLowerCase()).get(),
+                  builder: (c, snap) {
+                    if (snap.hasError) return Center(child: Text('Search error'));
+                    if (!snap.hasData) return Center(child: CircularProgressIndicator());
+                    final docs = snap.data!.docs;
+                    if (docs.isEmpty) return Center(child: Text('No results'));
+                    return ListView.builder(
+                      itemCount: docs.length,
+                      itemBuilder: (i, _) {
+                        final d = docs[i].data() as Map<String, dynamic>? ?? {};
+                        return ListTile(title: Text(d['authorName'] as String? ?? 'Unknown'), subtitle: Text((d['text'] as String? ?? '').length > 80 ? (d['text'] as String).substring(0, 80) + '...' : (d['text'] as String? ?? '')));
+                      },
+                    );
+                  },
+                ),
+        ),
+      ]),
+    );
+  }
+}
+
+/// ---------------- CAMERA PAGE ----------------
+class CameraPage extends StatefulWidget {
+  @override
+  _CameraPageState createState() => _CameraPageState();
+}
+class _CameraPageState extends State<CameraPage> {
+  final ImagePicker _picker = ImagePicker();
+  XFile? _picked;
+  double _filterStrength = 0.5;
+  bool _isUploading = false;
+  final postsRef = FirebaseFirestore.instance.collection('posts');
+
+  Future<void> _pickCamera() async {
+    try {
+      final f = await _picker.pickImage(source: ImageSource.camera, imageQuality: 85);
+      if (f == null) return;
+      setState(() => _picked = f);
+    } catch (e) {
+      debugPrint('pick camera error: $e');
+    }
+  }
+
+  Future<void> _pickGallery() async {
+    try {
+      final f = await _picker.pickImage(source: ImageSource.gallery, imageQuality: 85);
+      if (f == null) return;
+      setState(() => _picked = f);
+    } catch (e) {
+      debugPrint('pick gallery error: $e');
+    }
+  }
+
+  Widget _preview() {
+    if (_picked == null) return Container(height: 320, color: Colors.grey[200], child: Center(child: Text('No image selected')));
+    final img = Image.file(File(_picked!.path), fit: BoxFit.cover);
+    final s = _filterStrength;
+    final matrix = <double>[
+      1 + s * 0.2, 0, 0, 0, 0,
+      0, 1 + s * 0.05, 0, 0, 0,
+      0, 0, 1 - s * 0.1, 0, 0,
+      0, 0, 0, 1, 0,
+    ];
+    return SizedBox(height: 320, child: ColorFiltered(colorFilter: ColorFilter.matrix(matrix), child: img));
+  }
+
+  Future<void> _upload(String caption) async {
+    if (_picked == null) return;
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    setState(() => _isUploading = true);
+    try {
+      final ref = FirebaseStorage.instance.ref().child('posts/${DateTime.now().millisecondsSinceEpoch}_${user.uid}.jpg');
+      final uploadTask = await ref.putFile(File(_picked!.path));
+      final url = await uploadTask.ref.getDownloadURL();
+      await postsRef.add({
+        'authorId': user.uid,
+        'authorName': user.displayName ?? 'Anonymous',
+        'imageUrl': url,
+        'text': caption,
+        'createdAt': FieldValue.serverTimestamp(),
+        'likes': [],
+        'keywords': _generateKeywords(caption),
+        'filterStrength': _filterStrength,
+      });
+      setState(() => _picked = null);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded')));
+    } catch (e) {
+      debugPrint('upload error: $e');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload failed')));
+    } finally {
+      setState(() => _isUploading = false);
+    }
+  }
+
+  List<String> _generateKeywords(String text) {
+    final t = text.toLowerCase().trim();
+    if (t.isEmpty) return [];
+    final words = t.split(RegExp(r'\s+')).where((w) => w.length > 2).toSet().toList();
+    return words;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Camera')),
+      body: Padding(
+        padding: EdgeInsets.all(12),
+        child: Column(children: [
+          _preview(),
+          Slider(value: _filterStrength, onChanged: (v) => setState(() => _filterStrength = v)),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            ElevatedButton.icon(icon: Icon(Icons.camera), label: Text('Camera'), onPressed: _pickCamera),
+            SizedBox(width: 8),
+            ElevatedButton.icon(icon: Icon(Icons.photo), label: Text('Gallery'), onPressed: _pickGallery),
+            SizedBox(width: 8),
+            ElevatedButton.icon(icon: Icon(Icons.upload), label: _isUploading ? Text('Uploading...') : Text('Upload'), onPressed: _isUploading ? null : () => _upload('')),
+          ]),
+          SizedBox(height: 8),
+          Text('Note: face-tracking & premium 3D filters are TODO — integrate native SDKs later', style: TextStyle(fontSize: 12, color: Colors.grey)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// ---------------- CHATS + MOMENTS PAGE ----------------
+/// This page combines chat list + moments UI as requested (Calls removed).
+class ChatsAndMomentsPage extends StatefulWidget {
+  @override
+  _ChatsAndMomentsPageState createState() => _ChatsAndMomentsPageState();
+}
+class _ChatsAndMomentsPageState extends State<ChatsAndMomentsPage> {
+  int _tabIndex = 0; // 0 = Chats, 1 = Moments
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Chats & Moments'),
+        bottom: PreferredSize(preferredSize: Size.fromHeight(44), child: Row(children: [
+          Expanded(child: TextButton(onPressed: () => setState(() => _tabIndex = 0), child: Text('Chats', style: TextStyle(color: _tabIndex == 0 ? Colors.white : Colors.white70)))),
+          Expanded(child: TextButton(onPressed: () => setState(() => _tabIndex = 1), child: Text('Moments', style: TextStyle(color: _tabIndex == 1 ? Colors.white : Colors.white70)))),
+        ])),
+    
